@@ -13,6 +13,14 @@ A React.js application for connecting to Squads vaults and creating transaction 
 - ⚡ Uses @sqds/multisig package for transaction creation
 - 🛡️ Browser compatibility with Buffer polyfills
 
+## Screenshots
+
+### Main Application Interface
+![Squads Connect Interface](public/images/Squads-Connect-1.jpg)
+
+### Phantom Wallet Pop up for Token Transfer
+![Phantom Wallet Popup](public/images/wallet-popup.jpg)
+
 ## Setup
 
 1. **Install dependencies:**
