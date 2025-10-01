@@ -1,11 +1,11 @@
 import React, { useState, useEffect } from 'react';
-import { Connection, PublicKey, LAMPORTS_PER_SOL } from '@solana/web3.js';
-import { Squads } from '@squads-io/squads-sdk';
+import { Connection, PublicKey, LAMPORTS_PER_SOL, SystemProgram, TransactionMessage, Transaction } from '@solana/web3.js';
+import * as multisig from '@sqds/multisig';
 import './App.css';
 
+const SQUADS_PROGRAM_ID = "SQDS4ep65T869zMMBKyuUq6aD6EgTu8psMjkvj52pCf";
+
 function App() {
-  const [connection, setConnection] = useState(null);
-  const [squads, setSquads] = useState(null);
   const [wallet, setWallet] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const [isLoading, setIsLoading] = useState(false);
@@ -13,18 +13,16 @@ function App() {
   const [vaultInfo, setVaultInfo] = useState(null);
   const [recipientAddress, setRecipientAddress] = useState('');
   const [transferAmount, setTransferAmount] = useState('');
+  const [multisigPda, setMultisigPda] = useState(null);
+  const [vaultPda, setVaultPda] = useState(null);
+  const [walletAddress, setWalletAddress] = useState('');
 
   // Environment variables
-  const vaultAddress = process.env.REACT_APP_SQUAD_VAULT_ADDRESS;
   const multisigAccount = process.env.REACT_APP_MULTISIG_ACCOUNT;
   const defaultRecipient = process.env.REACT_APP_RECIPIENT_WALLET;
-  const rpcUrl = process.env.REACT_APP_RPC_URL || 'https://api.mainnet-beta.solana.com';
+  const rpcUrl = process.env.REACT_APP_RPC_URL;
 
   useEffect(() => {
-    // Initialize connection
-    const conn = new Connection(rpcUrl, 'confirmed');
-    setConnection(conn);
-    
     // Set default recipient if available
     if (defaultRecipient) {
       setRecipientAddress(defaultRecipient);
@@ -49,17 +47,13 @@ function App() {
       setStatus('Connecting to Phantom wallet...');
 
       const response = await wallet.connect();
-      const publicKey = new PublicKey(response.publicKey.toString());
+      const address = response.publicKey.toString();
       
       setIsConnected(true);
-      setStatus(`Connected to wallet: ${publicKey.toString()}`);
+      setWalletAddress(address);
+      setStatus(`Connected to wallet: ${address}`);
       
-      // Initialize Squads SDK
-      const squadsInstance = new Squads(connection, publicKey);
-      setSquads(squadsInstance);
-      
-      // Load vault information
-      await loadVaultInfo(squadsInstance);
+      await loadVaultInfo();
       
     } catch (error) {
       console.error('Error connecting wallet:', error);
@@ -69,36 +63,63 @@ function App() {
     }
   };
 
-  const loadVaultInfo = async (squadsInstance) => {
+  const loadVaultInfo = async () => {
     try {
-      if (!vaultAddress) {
-        setStatus('Vault address not configured in environment variables.');
+      if (!multisigAccount) {
+        setStatus('Multisig account not configured in environment variables.');
         return;
       }
 
-      const vaultPubkey = new PublicKey(vaultAddress);
+      setStatus('Loading vault information...');
+
+      const connection = new Connection(rpcUrl, 'confirmed');
+      const multisigPdaPubkey = new PublicKey(multisigAccount);
+      setMultisigPda(multisigAccount);
       
-      // Get vault details
-      const vaultDetails = await squadsInstance.getMultisig(vaultPubkey);
+      const [vaultPdaPubkey] = multisig.getVaultPda({ multisigPda: multisigPdaPubkey, index: 0 });
+      setVaultPda(vaultPdaPubkey.toString());
+      
+      const accountInfo = await connection.getAccountInfo(multisigPdaPubkey);
+      if (!accountInfo) {
+        throw new Error('Multisig account not found. Please check the vault address.');
+      }
+
+      if (accountInfo.owner.toString() !== SQUADS_PROGRAM_ID) {
+        throw new Error(`This is not a Squads multisig account. Owner: ${accountInfo.owner.toString()}, Expected: ${SQUADS_PROGRAM_ID}`);
+      }
+
+      const multisigAccountData = await multisig.accounts.Multisig.fromAccountAddress(connection, multisigPdaPubkey);
       
       setVaultInfo({
-        address: vaultAddress,
-        threshold: vaultDetails.threshold,
-        members: vaultDetails.members,
-        version: vaultDetails.version
+        multisigAddress: multisigAccount,
+        vaultAddress: vaultPdaPubkey.toString(),
+        threshold: multisigAccountData.threshold,
+        members: multisigAccountData.members,
+        version: multisigAccountData.version
       });
 
-      setStatus(`Vault loaded successfully. Threshold: ${vaultDetails.threshold}/${vaultDetails.members.length}`);
+      setStatus(`Vault loaded successfully. Threshold: ${multisigAccountData.threshold}/${multisigAccountData.members.length}`);
       
     } catch (error) {
       console.error('Error loading vault info:', error);
-      setStatus(`Error loading vault: ${error.message}`);
+      
+      if (error.message.includes('403') || error.message.includes('Access forbidden')) {
+        setStatus('RPC endpoint access denied. Please try a different RPC endpoint in your .env file.');
+      } else if (error.message.includes('fetch')) {
+        setStatus('Network error. Please check your internet connection and RPC endpoint.');
+      } else if (error.message.includes('COption') || error.message.includes('Expected to hold')) {
+        setStatus('Account structure error. This might not be a valid Squads multisig account or the SDK version is incompatible.');
+      } else if (error.message.includes('not a Squads multisig account')) {
+        setStatus('❌ This address is not a valid Squads multisig account. Please check the Squads app to get the correct multisig address.');
+      } else {
+        setStatus(`Error loading vault: ${error.message}`);
+      }
     }
   };
 
   const transferTokens = async () => {
-    if (!squads || !recipientAddress || !transferAmount) {
-      setStatus('Please fill in all required fields.');
+    if (!multisigPda || !vaultPda || !recipientAddress || !transferAmount) {
+      setStatus('Please fill in all required fields and ensure vault is loaded.');
       return;
     }
 
@@ -106,42 +127,75 @@ function App() {
       setIsLoading(true);
       setStatus('Preparing token transfer...');
 
+      const connection = new Connection(rpcUrl, 'confirmed');
+      const walletPublicKey = new PublicKey(wallet.publicKey);
       const recipientPubkey = new PublicKey(recipientAddress);
-      const amount = parseFloat(transferAmount) * LAMPORTS_PER_SOL; // Convert SOL to lamports
+      const vaultPdaPubkey = new PublicKey(vaultPda);
+      const multisigPdaPubkey = new PublicKey(multisigPda);
 
-      if (!vaultAddress) {
-        throw new Error('Vault address not configured');
+      const amount = parseFloat(transferAmount) * LAMPORTS_PER_SOL;
+
+      if (isNaN(amount) || amount <= 0) {
+        throw new Error('Invalid transfer amount');
       }
 
-      const vaultPubkey = new PublicKey(vaultAddress);
+      const transferInstruction = SystemProgram.transfer({
+        fromPubkey: vaultPdaPubkey,
+        toPubkey: recipientPubkey,
+        lamports: amount,
+      });
 
-      // Create a transaction to transfer SOL from the vault
-      const transaction = await squads.createTransaction(vaultPubkey);
-      
-      // Add transfer instruction
-      const transferInstruction = {
-        programId: new PublicKey('11111111111111111111111111111111'), // System Program
-        keys: [
-          { pubkey: vaultPubkey, isSigner: false, isWritable: true },
-          { pubkey: recipientPubkey, isSigner: false, isWritable: true }
-        ],
-        data: Buffer.alloc(4 + 8) // Transfer instruction + amount
-      };
+      const { blockhash } = await connection.getLatestBlockhash();
 
-      // Set up the transfer instruction data
-      const data = Buffer.alloc(4 + 8);
-      data.writeUInt32LE(2, 0); // Transfer instruction
-      data.writeBigUInt64LE(BigInt(amount), 4); // Amount in lamports
+      const transactionMessage = new TransactionMessage({
+        payerKey: walletPublicKey,
+        recentBlockhash: blockhash,
+        instructions: [transferInstruction],
+      });
 
-      transferInstruction.data = data;
+      const multisigAccountData = await multisig.accounts.Multisig.fromAccountAddress(connection, multisigPdaPubkey);
+      const currentTransactionIndex = Number(multisigAccountData.transactionIndex);
+      const transactionIndex = BigInt(currentTransactionIndex + 1);
 
-      await transaction.addInstruction(transferInstruction);
+      setStatus('Creating vault transaction...');
 
-      setStatus('Transaction created. Please review and sign...');
+      try {
+        const vaultTransactionInstruction = await multisig.instructions.vaultTransactionCreate({
+          multisigPda: multisigPdaPubkey,
+          transactionIndex,
+          creator: walletPublicKey,
+          vaultIndex: 0,
+          ephemeralSigners: 0,
+          transactionMessage,
+        });
 
-      // For now, we'll just show the transaction details
-      // In a real implementation, you would need to handle the multisig approval process
-      setStatus(`Transaction prepared for ${transferAmount} SOL to ${recipientAddress}. This requires multisig approval.`);
+        const proposalInstruction = await multisig.instructions.proposalCreate({
+          multisigPda: multisigPdaPubkey,
+          transactionIndex,
+          creator: walletPublicKey,
+        });
+
+        const combinedTransaction = new Transaction();
+        combinedTransaction.add(vaultTransactionInstruction);
+        combinedTransaction.add(proposalInstruction);
+        combinedTransaction.recentBlockhash = blockhash;
+        combinedTransaction.feePayer = walletPublicKey;
+
+        const signature = await wallet.signAndSendTransaction(combinedTransaction);
+
+        setStatus(
+          `✅ Transaction proposal created successfully! 
+          Transaction Index: ${transactionIndex.toString()}
+          Transaction Signature: ${signature}
+          Transfer Details:
+          • From: ${vaultPdaPubkey.toString()}
+          • To: ${recipientPubkey.toString()}
+          • Amount: ${transferAmount} SOL (${amount} lamports)`
+        );
+      } catch (createError) {
+        console.error('Error creating transaction or proposal:', createError);
+        setStatus(`❌ Failed to create transaction proposal automatically. Error: ${createError.message}`);
+      }
 
     } catch (error) {
       console.error('Error creating transfer:', error);
@@ -152,27 +206,56 @@ function App() {
   };
 
   const openSolscan = () => {
-    if (vaultAddress) {
-      window.open(`https://solscan.io/account/${vaultAddress}`, '_blank');
-    }
+    window.open(`https://solscan.io/account/${multisigAccount}`, '_blank');
   };
 
+
   return (
-    <div className="container">
-      <div className="card">
-        <h1 className="title">Squads Connect</h1>
-        <p className="subtitle">
-          Connect to your Squads vault and transfer tokens securely
-        </p>
+    <div className="app">
+      {/* Navigation Bar */}
+      <nav className="navbar">
+        <div className="nav-brand">
+          <h1 className="nav-title">Squads Connect</h1>
+        </div>
+        <div className="nav-wallet">
+          {isConnected && walletAddress ? (
+            <div className="wallet-info">
+              <span className="wallet-label">Connected:</span>
+              <span className="wallet-address">
+                {walletAddress.slice(0, 4)}...{walletAddress.slice(-4)}
+              </span>
+              <button 
+                className="wallet-disconnect"
+                onClick={() => {
+                  setIsConnected(false);
+                  setWalletAddress('');
+                  setVaultInfo(null);
+                  setStatus('');
+                }}
+              >
+                Disconnect
+              </button>
+            </div>
+          ) : (
+            <div className="wallet-info">
+              <span className="wallet-label">Not Connected</span>
+            </div>
+          )}
+        </div>
+      </nav>
+
+      <div className="container">
+        <div className="card">
+          <h1 className="title">Squads Connect</h1>
 
         {!isConnected ? (
           <button 
-            className="button" 
+            className="button connect-button" 
             onClick={connectWallet}
             disabled={isLoading || !wallet}
           >
             {isLoading ? <span className="loading"></span> : ''}
-            Connect Phantom Wallet
+            Connect Phantom
           </button>
         ) : (
           <div>
@@ -180,12 +263,30 @@ function App() {
               <h3>Vault Information</h3>
               {vaultInfo ? (
                 <>
-                  <p><strong>Address:</strong> {vaultInfo.address}</p>
+                  <p><strong>Multisig Address:</strong> {vaultInfo.multisigAddress}</p>
+                  <p><strong>Vault Address:</strong> {vaultInfo.vaultAddress}</p>
                   <p><strong>Threshold:</strong> {vaultInfo.threshold}/{vaultInfo.members.length}</p>
                   <p><strong>Members:</strong> {vaultInfo.members.length}</p>
                 </>
               ) : (
-                <p>Loading vault information...</p>
+                <div>
+                  <p>Loading vault information...</p>
+                  <div className="help-section">
+                    <h4>🔍 Need Help Finding Your Squads Address?</h4>
+                    <p>If you're getting an error, make sure you're using the correct address type.</p>
+                    <ol>
+                      <li>Go to <a href="https://app.squads.so" target="_blank" rel="noopener noreferrer">app.squads.so</a></li>
+                      <li>Connect your wallet and go to your squad settings</li>
+                      <li>Copy the <strong>Multisig Account</strong> address (not the Squad Vault address)</li>
+                      <li>Update your <code>.env</code> file with the multisig address</li>
+                    </ol>
+                    <div className="address-types">
+                      <p><strong>✅ Use this:</strong> Multisig Account address (e.g., BerUwitRYtiSxFnEHUEcuoRAmukC7BKS5fniVF2XPc7T)</p>
+                      <p><strong>❌ Don't use:</strong> Squad Vault address (e.g., 2jkmX7rorYkrqZeFwHjp14LCYM7vmpgdg79LrxQBmdEV)</p>
+                      <p><strong>💡 Note:</strong> The vault address is automatically derived from the multisig account.</p>
+                    </div>
+                  </div>
+                </div>
               )}
             </div>
 
@@ -212,30 +313,33 @@ function App() {
               />
             </div>
 
-            <button 
-              className="button" 
-              onClick={transferTokens}
-              disabled={isLoading || !recipientAddress || !transferAmount}
-            >
-              {isLoading ? <span className="loading"></span> : ''}
-              Transfer Tokens
-            </button>
+            <div className="button-group">
+              <button 
+                className="button" 
+                onClick={transferTokens}
+                disabled={isLoading || !recipientAddress || !transferAmount}
+              >
+                {isLoading ? <span className="loading"></span> : ''}
+                Transfer Tokens
+              </button>
 
-            <button 
-              className="button" 
-              onClick={openSolscan}
-              style={{ background: 'linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%)' }}
-            >
-              View on Solscan
-            </button>
+              <button 
+                className="button" 
+                onClick={openSolscan}
+                style={{ background: 'linear-gradient(135deg, #ff6b6b 0%, #ee5a24 100%)' }}
+              >
+                View on Solscan
+              </button>
+            </div>
           </div>
         )}
 
-        {status && (
-          <div className={`status ${status.includes('Error') ? 'error' : status.includes('Connected') || status.includes('successfully') ? 'success' : 'info'}`}>
-            {status}
-          </div>
-        )}
+          {status && (
+            <div className={`status ${status.includes('Error') ? 'error' : status.includes('Connected') || status.includes('successfully') ? 'success' : 'info'}`}>
+              {status}
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );
